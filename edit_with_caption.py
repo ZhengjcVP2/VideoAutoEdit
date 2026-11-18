@@ -13,6 +13,12 @@ edit_with_caption.py — 用字幕（可选叠加弹幕）交给大模型挑选�
     4. 逐块请大模型：结合前后文「上下文」行和弹幕热度，给出候选精彩片段
        （起止时间必须取自字幕边界、落在本块范围内）
     5. 汇总候选，再请大模型带着候选附近的字幕上下文做一次全局挑选
+    5.5 内容按 4 类管：剧情主线 / 闲聊杂谈 / 吐槽玩梗 / 其他（其余全部并成「其他」，
+       样本少的类型单独统计没意义）；四类的时长比例不是写死的，而是按候选池
+       实际供给 + 每类上下限（如主线 20%~60%）动态分配
+    5.6 逻辑连接：主播吐槽 / 评论某条信息时，如果那条信息就在上文很近的地方
+       （关键词接续 / 指代上一句），把出处一起并进片段；关联不强的上下文不补，
+       保证内容完整的同时时长尽量紧凑
     6. 程序做硬校验：时间顺序、互不重叠、单段 >= MIN_CLIP_SEC、
        总时长落在 [TARGET_MIN_SEC, TARGET_MAX_SEC]
     7. 音频对齐：每个剪辑点向外扩最多 SNAP_MAX_SHIFT 秒，切到附近最安静的位置，
@@ -133,30 +139,48 @@ OVERFLOW_TOLERANCE_SEC = 30.0       # 音频对齐后允许超出成片上限的
 #                自动：剧情/主线 85%、杂谈闲聊 1%（只挑剧情和战斗的结果）
 #   主播占比  —— 手动：主播说话占语音 94%；自动：55%（选了很多纯游戏演出）
 # 下面这组常量就是要补这两个差距：给候选打类型 / 主播占比，按配比重新配平。
-CONTENT_TYPES = ["剧情/主线", "战斗/操作", "抽卡/养成", "读弹幕互动", "杂谈闲聊",
-                 "吐槽/玩梗", "攻略/讲解", "情绪高光", "其他"]
+#
+# 只分 4 类：剧情主线 / 闲聊杂谈 / 吐槽玩梗 这三类在手动剪辑里样本足够，
+# 其余（战斗、抽卡、读弹幕、攻略、纯情绪爆发……）单独统计样本太少、
+# 大模型之间的边界也不稳定，统一并成「其他」，避免分类不准带偏配比。
+CONTENT_TYPES = ["剧情/主线", "杂谈闲聊", "吐槽/玩梗", "其他"]
 
-# 类型定义：要和 compare_edited_video.py 里的 TOPIC_GUIDE 保持一致，
+# 旧版 9 类 -> 新版 4 类（兼容老计划 / 大模型偶尔照抄旧类型名）
+LEGACY_TYPE_MAP = {
+    "剧情/主线": "剧情/主线",
+    "杂谈闲聊": "杂谈闲聊",
+    "吐槽/玩梗": "吐槽/玩梗",
+    "战斗/操作": "其他",
+    "抽卡/养成": "其他",
+    "读弹幕互动": "其他",
+    "攻略/讲解": "其他",
+    "情绪高光": "其他",
+    "其他": "其他",
+}
+
+# 类型定义：前 3 类要和 compare_edited_video.py 里的 TOPIC_GUIDE 保持一致，
 # 否则两边对「杂谈 / 吐槽」的边界不一样，测出来的配比就对不上优化目标
 CONTENT_TYPE_GUIDE = """- 剧情/主线：游戏剧情推进、主线对话、关键演出（主播在旁边解说/反应）
-- 战斗/操作：打怪、操作、走位、Boss 战
-- 抽卡/养成：抽卡、角色培养、开荒、配队
-- 读弹幕互动：念弹幕、回答观众问题、和观众互动
-- 杂谈闲聊：主播随口聊日常、感想、和游戏无关的话题
-- 吐槽/玩梗：对游戏内容/事件的吐槽、玩梗、整活、情绪化评价（有明确吐槽对象）
-- 攻略/讲解：讲机制、讲思路、教学
-- 情绪高光：纯情绪爆发（惊讶、爆笑、破防），没有明确吐槽对象和内容
-- 其他：以上都不像"""
+- 杂谈闲聊：主播随口聊日常、感想、和游戏无关的话题（没有明确的吐槽对象）
+- 吐槽/玩梗：针对具体对象（剧情桥段、角色、弹幕、翻车事故）的吐槽、玩梗、
+  整活、情绪化评价，主播在评论「某个东西」
+- 其他：以上三类之外的一切——战斗/操作、抽卡/养成、读弹幕互动、攻略讲解、
+  纯情绪爆发、跑图打怪。这类样本少不用细分，只挑确实精彩的"""
 
 CONTENT_MIX_ENABLED = True          # 是否按目标内容配比校正
-CONTENT_MIX = {                     # 目标配比（按时间占比），取自手动剪辑样本
+CONTENT_MIX = {                     # 先验配比（按时间占比），取自手动剪辑样本
     "剧情/主线": 0.40,
     "杂谈闲聊": 0.32,
     "吐槽/玩梗": 0.14,
-    "读弹幕互动": 0.04,
-    "战斗/操作": 0.05,
-    "攻略/讲解": 0.03,
-    "情绪高光": 0.02,
+    "其他": 0.14,
+}
+# 每类的动态区间（占成片时长的比例）：实际配比在候选池供给的基础上、
+# 夹在这个区间里浮动，而不是死盯一个固定比例（某类好货不够就自然少给）
+CONTENT_MIX_RANGE = {
+    "剧情/主线": (0.20, 0.60),
+    "杂谈闲聊": (0.15, 0.45),
+    "吐槽/玩梗": (0.08, 0.30),
+    "其他": (0.05, 0.35),
 }
 MIX_TOLERANCE = 0.05                # 每类允许偏离目标的比例（占目标总时长）
 MIX_MAX_ITER = 50                  # 配平循环的最大迭代次数（每次只动一段）
@@ -167,6 +191,25 @@ MIN_CLIP_STREAMER_RATIO = 0.40      # 候选里主播说话占比低于这个就
 TRIM_TO_STREAMER = False            # 片段首尾的大段非主播语音（纯游戏演出）裁掉
 TRIM_MIN_SEC = 8.0                  # 首尾超过这个秒数的非主播语音才裁
 TRIM_MAX_SEC = 90.0                 # 单侧最多裁多少秒
+
+# ---------------------------------------------------------------------------
+# 逻辑连接：把「主播吐槽的出处」并进片段（只在关联强的时候补，否则保持精简）
+#   典型场景：主播说「这什么鬼提示啊」——上文 8 秒前刚出现的那句任务提示就是
+#   被吐槽的对象，一起带上才看得懂；如果上文是在聊别的事，就不要往回拉。
+# ---------------------------------------------------------------------------
+LOGIC_LINK_ENABLED = True           # 开关：是否做上文出处拼接
+LOGIC_BLOCK_GAP_SEC = 2.5           # 字幕间隔小于这个秒数算同一句「说话块」
+LOGIC_LINK_LOOKBACK_SEC = 90.0      # 最多往前看多少秒
+LOGIC_LINK_MAX_GAP_SEC = 25.0       # 上文和本段之间超过这个空档就不算「很近」
+LOGIC_LINK_MAX_EXT_SEC = 60.0       # 单段最多往前补多少秒
+LOGIC_LINK_MIN_OVERLAP = 0.10       # 开头用词和上文的二词重合度达到这个才算强关联
+LOGIC_LINK_REF_GAP_SEC = 8.0        # 开头是「这个/刚才/你看」时，上文要在这个秒数内
+LOGIC_LINK_REF_MIN_OVERLAP = 0.04   # 指代场景下重合度的下限（放宽一些）
+LOGIC_LINK_REF_EXT_SEC = 25.0       # 指代场景下单次最多往前补多少秒
+LOGIC_LINK_PAD_SEC = 0.4            # 补上文的起点再多留一点余量
+LOGIC_LINK_EXTRA_BUDGET_SEC = 90.0  # 全片因补上文最多多花多少秒
+LOGIC_OPEN_CHARS = 80               # 判定「本段开头在说什么」取多少字
+LOGIC_OPEN_MAX_SEC = 30.0           # 上面那段开头文字最多往后取多少秒
 
 # 运行时开关（main 根据命令行 / 字幕里有没有（主播）标记来覆盖）
 PROFILE = {
@@ -183,7 +226,7 @@ PROFILE = {
 #   Premiere 按平均帧率推算时间就会越往后越错位；整体重编码成 CFR 即可。
 # ---------------------------------------------------------------------------
 REENCODE_OUTPUT = True              # 开关：拼接完成后再整体重编码
-REENCODE_CRF = 18                   # 画质档位（18 视觉上接近源片，越小越清晰）
+REENCODE_CRF = 16                   # 画质档位（18 视觉上接近源片，越小越清晰）
 REENCODE_PRESET = "slow"            # x264 速度档（veryfast 更快，slow 更省体积）
 REENCODE_MAXRATE_RATIO = 2.0       # 码率上限 = 源视频码率 × 该系数（限制体积不膨胀）
 REENCODE_AUDIO_BITRATE = 0          # 音频目标码率（bit/s），0 = 沿用源音频码率
@@ -658,14 +701,29 @@ def _speaker_entry(e):
 
 
 def _clean_type(value):
+    """把大模型给的类型收敛到 4 类；旧类型名 / 简写也能认出来。"""
     value = str(value or "").strip()
-    return value if value in CONTENT_TYPES else "其他"
+    if value in CONTENT_TYPES:
+        return value
+    if value in LEGACY_TYPE_MAP:
+        return LEGACY_TYPE_MAP[value]
+    for key, t in (("剧情", "剧情/主线"), ("主线", "剧情/主线"),
+                   ("杂谈", "杂谈闲聊"), ("闲聊", "杂谈闲聊"),
+                   ("吐槽", "吐槽/玩梗"), ("玩梗", "吐槽/玩梗")):
+        if key in value:
+            return t
+    return "其他"
 
 
-def _mix_text(mix):
-    """把配比字典排成「剧情/主线 40%、杂谈闲聊 32%」这种一行字。"""
-    return "、".join(f"{t} {w * 100:.0f}%" for t, w in
-                     sorted(mix.items(), key=lambda kv: -kv[1]) if w > 0)
+def _mix_range_text(mix=None, ranges=None):
+    """带上下限的配比说明（给大模型看）：剧情/主线 40%（20%~60%）。"""
+    mix = mix if mix is not None else CONTENT_MIX
+    ranges = ranges if ranges is not None else CONTENT_MIX_RANGE
+    rows = []
+    for t, w in sorted(mix.items(), key=lambda kv: -kv[1]):
+        lo, hi = ranges.get(t, (0.0, 1.0))
+        rows.append(f"{t} {w * 100:.0f}%（可浮动 {lo * 100:.0f}%~{hi * 100:.0f}%）")
+    return "、".join(rows)
 
 
 def _mix_quotas(total, mix=None):
@@ -677,6 +735,85 @@ def _mix_quotas(total, mix=None):
         quotas[t] = max(q, 0)
         remain -= quotas[t]
     return quotas
+
+
+def _clip_allocate(weights, lo, hi, total=1.0, iters=50):
+    """把权重归一化后夹进 [lo, hi]，差额按「还有多少空间」补 / 扣回去。
+
+    返回值不强求和为 total：如果所有类型都被 hi（候选池供给）卡住，
+    剩下的就是「这块片子里根本凑不出来的量」，调用方据此知道配额取不满。
+    """
+    keys = list(weights)
+    raw = {t: max(float(weights[t]), 0.0) for t in keys}
+    s = sum(raw.values())
+    w = ({t: raw[t] / s * total for t in keys} if s > 0
+         else {t: total / len(keys) for t in keys})
+    w = {t: min(max(w[t], lo[t]), hi[t]) for t in keys}
+
+    for _ in range(iters):
+        diff = total - sum(w.values())
+        if abs(diff) < 1e-6:
+            break
+        if diff > 0:                      # 还差：按剩余空间 (hi - w) 加
+            room = {t: hi[t] - w[t] for t in keys if hi[t] - w[t] > 1e-9}
+            base = sum(room.values())
+            if base <= 1e-9:
+                break                     # 每类都到顶了：供给不够，配额只能少给
+            step = min(diff, base)
+            for t, r in room.items():
+                w[t] += step * r / base
+        else:                             # 超了：按可下降空间 (w - lo) 扣
+            room = {t: w[t] - lo[t] for t in keys if w[t] - lo[t] > 1e-9}
+            base = sum(room.values())
+            if base <= 1e-9:
+                break
+            step = min(-diff, base)
+            for t, r in room.items():
+                w[t] -= step * r / base
+    return w
+
+
+def dynamic_mix(pool=None, budget=None, mix=None, ranges=None, floor_sec=None):
+    """按候选池的实际供给动态分配 4 类内容的时长比例。
+
+    先用手动剪辑样本的配比当先验，再按「这一片里每类实际有多少好货」调整，
+    每类都夹在 CONTENT_MIX_RANGE 的区间里：
+        剧情/主线 20%~60%、杂谈闲聊 15%~45%、吐槽/玩梗 8%~30%、其他 5%~35%
+    某类候选严重不够时，下限让位给实际供给（否则配额永远取不满、
+    只能拿不相关的片段硬凑）。传 None 池子时直接返回先验配比。
+
+    floor_sec = 成片最短时长：上限卡得太死、按配额算出来连最短时长都凑不够时，
+    以时长为先放宽上限（宁可配比差一点，也不要交一条过短的成片）。
+    """
+    mix = dict(mix or CONTENT_MIX)
+    ranges = ranges if ranges is not None else CONTENT_MIX_RANGE
+    types = list(CONTENT_TYPES)
+    weights = {t: float(mix.get(t, 0.0)) for t in types}
+    lo, hi = {}, {}
+    for t in types:
+        r = ranges.get(t, (0.0, 1.0))
+        lo[t], hi[t] = float(r[0]), float(r[1])
+
+    avail = {}
+    if pool and budget and budget > 0:
+        avail = {t: 0.0 for t in types}
+        for c in pool:
+            t = c.get("type") or "其他"
+            avail[t] = avail.get(t, 0.0) + _dur(c)
+        for t in types:
+            cap = avail.get(t, 0.0) / float(budget)
+            if cap < lo[t]:
+                lo[t] = cap              # 供不上：下限让位给实际供给
+            hi[t] = max(min(hi[t], cap), lo[t])
+            if avail.get(t, 0.0) <= 0:   # 完全没货的类型不占配额
+                weights[t] = 0.0
+
+    shares = _clip_allocate(weights, lo, hi, 1.0)
+    if (avail and budget and floor_sec and floor_sec > 0
+            and sum(shares.values()) * budget < floor_sec
+            and sum(avail.values()) >= floor_sec):
+        shares = _clip_allocate(weights, lo, {t: 1.0 for t in types}, 1.0)
+    return shares
 
 
 def _quota_text(quotas):
@@ -814,6 +951,13 @@ CHUNK_SYSTEM = """你是游戏直播回放的精剪助手。你会看到一段�
   也不要越出本段范围（「上下文」行不能作为边界）；
 - 片段要尽量语义完整：起点落在话题/句子开头，终点落在说完之后，
   不要从半句话中间开始或结束；宁可多带一点前因后果；
+- **逻辑连接（很重要）**：主播在吐槽 / 评论某个信息时，如果那条信息就在上文
+  很近的地方（同一话题的上一句、刚出现的提示/字幕/剧情），就把那条信息
+  一起包进片段，起点提到信息出现之前，让观众看得懂他在骂什么；
+  反之，如果找上文的关联内容离得远（-> {logic_gap}s）、或者和本段话题对不上，
+  就**不要**往回带，直接从主播这段话自己的起点开始（宁可短一点，不要夹无关内容）；
+- **精简**：片段里不要夹和主题无关的空转（纯跑图、无解说演出、重复操作），
+  但也不能为了缩短把一句话 / 一个包袱切一半；
 - 每个片段 end - start >= {min_clip} 秒，且必须落在本段范围内；
 - 按时间顺序输出，最多 {max_items} 个，score 越高越优先；
 - **优先选主播本人在说话、有解说、有反应的片段**：整段几乎全是游戏过场语音
@@ -846,17 +990,18 @@ def analyze_chunk(entries, lo, hi, danmaku_text, min_clip, max_items, edit_promp
         [render(e, False) for e in inside] +
         [render(e, True) for e in after[:8]])
 
-    mix_hint = (_mix_text(CONTENT_MIX) if PROFILE["mix"]
+    mix_hint = (_mix_range_text() if PROFILE["mix"]
                 else "不限定（按精彩程度挑）")
     quota_hint = (_quota_text(_mix_quotas(max_items)) if PROFILE["mix"]
                   else f"不超过 {max_items} 个")
     system = CHUNK_SYSTEM.format(
         min_clip=f"{min_clip:g}",
         max_items=max_items,
-        content_types="、".join(CONTENT_TYPES[:-1]),
+        content_types="、".join(CONTENT_TYPES),
         content_guide=CONTENT_TYPE_GUIDE,
         content_mix=mix_hint,
         chunk_quota=quota_hint,
+        logic_gap=f"{LOGIC_LINK_MAX_GAP_SEC:g}",
         edit_prompt=edit_prompt or "无",
     )
     user = (f"本段范围：{lo:.1f}s - {hi:.1f}s（片段 start/end 必须落在这段范围内）\n\n"
@@ -899,6 +1044,12 @@ FINAL_SYSTEM = """你是总剪辑师。输入是按时间排序的候选片段�
 7. 如果字幕上下文显示某候选从半句话开始、话没说完就结束，
    或与另一候选是同一段剧情的前后两截，避开它或只保留更完整的一个；
 8. 避免全片都是同一主题，也不要整片都是纯剧情过场（没有主播解说）。
+9. **逻辑连贯优先**：优先保留「上文给了信息 -> 主播吐槽 / 反应」这种成对的片段；
+   相邻候选如果话题连得上、中间只隔几秒，当作一段连续内容一起选（不要切成两截）；
+   找不到前因的孤立反应（上来就「这太好笑了」「什么玩意」）尽量别选，
+   除非它本身就完整；
+10. **精简但不破碎**：关联不强的前后文不要为了凑时长一起选，
+    但也不要为了缩短时长挑半句话的片段。
 
 只输出 JSON：{{"selected": [候选编号, ...]}}，按时间顺序排列。
 """
@@ -933,7 +1084,7 @@ def select_with_llm(candidates, entries, target_min, target_max, min_clip):
         excerpt = _excerpt(entries, c["start"], c["end"])
         if excerpt:
             rows.append(f"    字幕: {excerpt}")
-    mix_hint = (_mix_text(CONTENT_MIX) if PROFILE["mix"]
+    mix_hint = (_mix_range_text() if PROFILE["mix"]
                 else "不限定（按精彩程度挑）")
     system = FINAL_SYSTEM.format(min_clip=f"{min_clip:g}",
                                  target_min=f"{target_min:g}",
@@ -1047,7 +1198,12 @@ def _pool_ratio(segs):
 
 
 def shortlist_candidates(candidates, limit=LLM_FINAL_MAX_CANDIDATES):
-    """全局挑选前按内容配额截断候选：保证每类都有好货，提示词也不会太长。"""
+    """全局挑选前按内容配额截断候选：保证每类都有好货，提示词也不会太长。
+
+    配额用 dynamic_mix 按候选池实际供给动态算，而不是死守固定比例：
+    某类根本没多少候选时，配额自然少给，把名额让给别的类型（否则结果里
+    会充满低分的凑数片段）。
+    """
     items = list(candidates)
     if len(items) <= limit or limit <= 0:
         return items
@@ -1055,14 +1211,16 @@ def shortlist_candidates(candidates, limit=LLM_FINAL_MAX_CANDIDATES):
     if not PROFILE["mix"]:
         return sorted(items, key=rank)[:limit]
 
-    quotas = _mix_quotas(limit)
+    shares = dynamic_mix(items, sum(_dur(c) for c in items) or 1.0)
     by_type = {}
     for c in sorted(items, key=rank):
         by_type.setdefault(c.get("type") or "其他", []).append(c)
     picked = []
-    for t, q in quotas.items():
-        if q > 0:
-            picked.extend((by_type.get(t) or [])[:q])
+    for t, share in sorted(shares.items(), key=lambda kv: -kv[1]):
+        want = int(round(share * limit))
+        if want <= 0:
+            continue
+        picked.extend((by_type.get(t) or [])[:want])
     if len(picked) < limit:                 # 某类候选不够，用剩下的高分补齐
         picked_ids = {c.get("id") for c in picked}
         picked.extend([c for c in sorted(items, key=rank)
@@ -1076,15 +1234,17 @@ def align_to_profile(segments, candidates, target_min, target_max, min_clip):
 
     做法是「配额重建」而不是反复增删，避免来回震荡：
       1. 预算 T = 当前总时长（夹在 target_min ~ target_max 之间）；
-      2. 按目标配比算出每类该占多少秒，从候选池里依次取（大模型选过的优先，
+      2. **动态配额**：按先验配比 + 候选池里每类的实际供给，算出每类该占多少秒
+         （每类夹在 CONTENT_MIX_RANGE 区间里，比如主线 20%~60%、
+         杂谈 15%~45%），从候选池里依次取（大模型选过的优先，
          其次分数 + 主播占比高的），同类型取到配额为止；
       3. 配额取完还有富余，用最优候选补到 T（候选不够就算了）；
-      4. 主播说话占比不达标时，用高主播候选把最低的几段换掉。
-    4 步都是确定性的，不会来回震荡；配比 / 主播目标都在文件头常量里。
+      4. 超长时先砍超额类别（按动态配额判定超额，而不是固定比例）；
+      5. 主播说话占比不达标时，用高主播候选把最低的几段换掉。
+    每步都是确定性的，不会来回震荡；配比 / 主播目标都在文件头常量里。
     """
     if not segments:
         return []
-    mix = dict(CONTENT_MIX) if PROFILE["mix"] else {}
     target_ratio = PROFILE["streamer_target"] if PROFILE["has_streamer"] else 0.0
 
     budget = min(max(sum(_dur(s) for s in segments), target_min), target_max)
@@ -1096,6 +1256,12 @@ def align_to_profile(segments, candidates, target_min, target_max, min_clip):
 
     pool = [c for c in candidates if _dur(c) >= min_clip]
     pool.sort(key=value, reverse=True)
+
+    # 4 类内容的比例不是写死的：先验配比 + 本片候选池的实际供给，夹到各自的上下限
+    mix = (dynamic_mix(pool, budget, floor_sec=target_min)
+           if PROFILE["mix"] else {})
+    if mix:
+        log(f"  · 动态配额：{_fmt_mix(mix)}")
 
     kept, used = [], set()
 
@@ -1137,9 +1303,11 @@ def align_to_profile(segments, candidates, target_min, target_max, min_clip):
             if c.get("id") in used or not fits(c):
                 continue
             t = c.get("type") or "其他"
-            if (strict and mix and t in mix
-                    and sec_of(t) >= budget * mix[t] + min_clip):
-                continue
+            if strict and mix:
+                quota = budget * (mix.get(t) or 0.0)
+                # 配额几乎为 0 的类型（候选池本来就少）不再拿来凑数
+                if quota < min_clip or sec_of(t) >= quota:
+                    continue
             use(c)
             total += _dur(c)
 
@@ -1168,7 +1336,7 @@ def align_to_profile(segments, candidates, target_min, target_max, min_clip):
         victim = min(kept, key=lambda s: (float(s.get("streamer_ratio") or 0),
                                           float(s.get("score", 5))))
         v_ratio = float(victim.get("streamer_ratio") or 0)
-        best = None
+        best, fallback = None, None
         for c in pool:
             if c.get("id") in used:
                 continue
@@ -1176,8 +1344,15 @@ def align_to_profile(segments, candidates, target_min, target_max, min_clip):
                 continue
             if not fits(c, skip=victim):
                 continue
+            # 优先换进「还没超配额」的类型，别让主播替换把 4 类配比带偏
+            t = c.get("type") or "其他"
+            if mix and sec_of(t) >= budget * (mix.get(t) or 0.0) + min_clip:
+                if fallback is None:
+                    fallback = c
+                continue
             best = c
             break
+        best = best or fallback
         if best is None:
             break
         kept.remove(victim)
@@ -1212,6 +1387,166 @@ def segment_profile(entries, segments):
 
 def _fmt_mix(mix):
     return " · ".join(f"{t} {w * 100:.0f}%" for t, w in mix.items())
+
+
+# ---------------------------------------------------------------------------
+# 逻辑连接：把「主播吐槽 / 评论的出处」并进片段
+#   「这什么鬼提示啊」这类反应，观众得先看到 8 秒前那条提示才看得懂，
+#   所以只要上文和本段明显在说同一件事（关键词接续 / 指代上一句），
+#   就把上文一起带上；关联不强的上下文坚决不补，保证时间紧凑。
+# ---------------------------------------------------------------------------
+_GRAM_CLEAN_RE = re.compile(r"[^\u4e00-\u9fffA-Za-z0-9]+")
+# 这些两字组合到处都是，不能当成「在说同一件事」的证据
+_STOP_GRAMS = {
+    "这个", "那个", "就是", "然后", "所以", "因为", "但是", "我们", "你们",
+    "他们", "现在", "时候", "真的", "可以", "感觉", "知道", "什么", "怎么",
+    "一下", "已经", "还是", "不过", "其实", "应该", "觉得", "有点", "不是",
+    "没有", "这么", "那么", "一个", "这种", "那种", "这样", "那样", "这里",
+    "那里", "东西", "直接", "看到", "去看", "完了", "还有",
+}
+# 明确指向「上文刚出现的东西」的说法（不包含「他 / 这」这类过于常见的词）
+_REF_WORD_RE = re.compile(
+    r"这个|那个|刚才|刚刚|前面|上面|你看|这波|这玩意|这什么|这提示|这句|这俩|这一下")
+
+
+def _text_grams(text):
+    """把文字拆成两字词集合（去掉泛用词），用来判断两段话是不是同一件事。"""
+    clean = _GRAM_CLEAN_RE.sub("", text or "")
+    grams = {clean[i:i + 2] for i in range(len(clean) - 1)}
+    return {g for g in grams if g not in _STOP_GRAMS}
+
+
+def build_speech_blocks(entries, gap_sec=LOGIC_BLOCK_GAP_SEC):
+    """把字幕按停顿合成「说话块」，作为补齐上文时的最小单位。"""
+    blocks = []
+    for e in entries:
+        if blocks and e["start"] - blocks[-1]["end"] <= gap_sec:
+            blocks[-1]["end"] = max(blocks[-1]["end"], e["end"])
+            blocks[-1]["items"].append(e)
+        else:
+            blocks.append({"start": e["start"], "end": e["end"], "items": [e]})
+    for blk in blocks:
+        blk["text"] = "".join(i.get("text") or "" for i in blk["items"])
+    return blocks
+
+
+def _opening_text(entries, start, chars=LOGIC_OPEN_CHARS,
+                  max_sec=LOGIC_OPEN_MAX_SEC):
+    """取片段开头的一小段文字，代表「这段话在说什么」。"""
+    out, total = [], 0
+    for e in entries:
+        if e["end"] <= start:
+            continue
+        if e["start"] - start > max_sec:
+            break
+        out.append(e.get("text") or "")
+        total += len(e.get("text") or "")
+        if total >= chars:
+            break
+    return "".join(out)[:chars]
+
+
+def find_context_start(blocks, start, open_text, prev_end=None, max_ext=None):
+    """找「本段开头提到的信息」在上文的出处。
+
+    返回 (新起点, 说明) 或 None。判定两种：
+      1. 关键词接续：开头用词和上文的二词重合度 >= LOGIC_LINK_MIN_OVERLAP；
+      2. 指代上一句：开头是「这个/刚才/你看」之类，且上一句就在几秒内。
+    离得远（> LOGIC_LINK_MAX_GAP_SEC）、或者已经被前面的片段用掉的，不补。
+    """
+    max_ext = LOGIC_LINK_MAX_EXT_SEC if max_ext is None else max_ext
+    open_grams = _text_grams(open_text)
+    if not open_grams:
+        return None
+
+    floor = start - LOGIC_LINK_LOOKBACK_SEC
+    lo_bound = (prev_end + 0.05) if prev_end is not None else None
+    run, cursor = [], start
+
+    # 1) 本段所在说话块里、位于起点之前的部分（同一句话的前半截也要算上文）
+    host = next((b for b in blocks
+                 if b["start"] < start - 0.05 and b["end"] > start - 0.05), None)
+    if host is not None:
+        head_start = host["start"]
+        if lo_bound is not None:
+            head_start = max(head_start, lo_bound)
+        head_text = "".join(i.get("text") or "" for i in host["items"]
+                            if head_start - 0.05 <= i["start"] < start - 0.05)
+        if head_text:
+            run.append({"start": head_start, "end": start, "text": head_text})
+            cursor = head_start
+
+    # 2) 再往前整块整块地捡，断档太大 / 碰到前一段就停
+    for blk in reversed(blocks):
+        if blk["end"] > cursor + 0.05:
+            continue                     # 已经把这块算进来了（或是本段自己）
+        if blk["end"] < floor:
+            break
+        if lo_bound is not None and blk["start"] < lo_bound - 0.05:
+            break                        # 这块已经在前面的片段里了
+        if cursor - blk["end"] > LOGIC_LINK_MAX_GAP_SEC:
+            break                        # 中间断档太大，不算「上文很近」
+        run.append(blk)
+        cursor = blk["start"]
+        if len(run) >= 7 or start - blk["start"] > max_ext:
+            break
+    if not run:
+        return None
+
+    nearest_gap = start - run[0]["end"]
+    for n in range(1, len(run) + 1):
+        chunk = run[:n]                  # 离本段最近的 n 块
+        grams = _text_grams("".join(b["text"] for b in chunk))
+        if not grams:
+            continue
+        overlap = len(open_grams & grams) / len(open_grams)
+        new_start = min(b["start"] for b in chunk) - LOGIC_LINK_PAD_SEC
+        new_start = max(new_start, start - max_ext)
+        if lo_bound is not None:
+            new_start = max(new_start, lo_bound)
+        if overlap >= LOGIC_LINK_MIN_OVERLAP and start - new_start >= 1.0:
+            return new_start, f"关键词接续 {overlap * 100:.0f}%"
+        if (n == 1 and nearest_gap <= LOGIC_LINK_REF_GAP_SEC
+                and _REF_WORD_RE.search(open_text)
+                and overlap >= LOGIC_LINK_REF_MIN_OVERLAP):
+            new_start = max(new_start, start - LOGIC_LINK_REF_EXT_SEC)
+            if start - new_start >= 1.0:
+                return new_start, f"指代上文（{nearest_gap:.0f}s 前）"
+    return None
+
+
+def stitch_context(segments, entries, max_total=None):
+    """逐段往前补上「被吐槽的出处」，补出来的时长有总预算，不会把成片撑长。"""
+    if not LOGIC_LINK_ENABLED or not segments:
+        return segments, {"extended": 0, "extra": 0.0}
+
+    ordered = sorted(segments, key=lambda x: (x["start"], x["end"]))
+    total = sum(_dur(s) for s in ordered)
+    cap = total + LOGIC_LINK_EXTRA_BUDGET_SEC if max_total is None else max_total
+    room = min(LOGIC_LINK_EXTRA_BUDGET_SEC, cap - total)
+    blocks = build_speech_blocks(entries)
+
+    out, extended, extra, prev_end = [], 0, 0.0, None
+    for seg in ordered:
+        item = dict(seg)
+        start = float(item["start"])
+        if room > 1.0:
+            found = find_context_start(
+                blocks, start, _opening_text(entries, start),
+                prev_end=prev_end, max_ext=min(LOGIC_LINK_MAX_EXT_SEC, room))
+            if found:
+                new_start, why = found
+                gain = start - new_start
+                if 0.5 < gain <= room:
+                    item["start"] = new_start
+                    item["ctx_sec"] = round(gain, 1)
+                    item["ctx_reason"] = why
+                    extended += 1
+                    extra += gain
+                    room -= gain
+        out.append(item)
+        prev_end = float(item["end"])
+    return out, {"extended": extended, "extra": extra}
 
 
 # ---------------------------------------------------------------------------
@@ -1743,6 +2078,9 @@ def save_plan(segments, out_path, parts=None):
                 f.write(f"    类型: {seg['type']}\n")
             if seg.get("streamer_ratio") is not None:
                 f.write(f"    主播说话: {seg['streamer_ratio'] * 100:.0f}%\n")
+            if seg.get("ctx_sec"):
+                f.write(f"    上文补齐: {seg['ctx_sec']:+.1f}s"
+                        f"（{seg.get('ctx_reason', '')}）\n")
             if seg.get("orig_start") is not None:
                 ds = seg["start"] - seg["orig_start"]
                 de = seg["end"] - seg.get("orig_end", seg["end"])
@@ -2000,7 +2338,7 @@ def main():
         f"，单段 >= {args.min_clip:g}s")
     log(f"提示词   : {args.prompt or '（空）'}")
     if not plan_segments:
-        log("剪辑倾向 : " + (f"内容配比 {_fmt_mix(CONTENT_MIX)}" if PROFILE["mix"]
+        log("剪辑倾向 : " + (f"内容配比 {_mix_range_text()}" if PROFILE["mix"]
                              else "不校正内容配比"))
 
     # ---- 读字幕 ----
@@ -2092,6 +2430,15 @@ def main():
         log(f"剪辑倾向 : 主播说话 {before['streamer'] * 100:.0f}% -> "
             f"{after['streamer'] * 100:.0f}%（目标 {PROFILE['streamer_target'] * 100:.0f}%）")
         log(f"内容配比 : {_fmt_mix(after['mix'])}")
+
+        # ---- 逻辑连接：主播吐槽 / 评论的上文出处一起带上（关联强才补）----
+        segments, link = stitch_context(
+            segments, entries, args.target_max + OVERFLOW_TOLERANCE_SEC)
+        if link["extended"]:
+            log(f"逻辑连接 : {link['extended']} 段往前补上了出处"
+                f"（+{link['extra']:.1f}s）")
+        else:
+            log("逻辑连接 : 没有需要往前补的强关联上文")
 
     # ---- 音频对齐：边界向外扩到静音处，保证句子 / 剧情完整 ----
     if plan_segments:
