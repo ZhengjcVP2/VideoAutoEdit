@@ -24,13 +24,23 @@ edit_with_caption.py — 用字幕（可选叠加弹幕）交给大模型挑选�
     7. 音频对齐：每个剪辑点向外扩最多 SNAP_MAX_SHIFT 秒，切到附近最安静的位置，
        避免把句子或剧情切一半（与 auto_edit.py 的做法一致）；
        因此带来的轻微超长（默认 OVERFLOW_TOLERANCE_SEC 内）优先保片段完整
-    8. 用 stream copy 逐段切 + concat 拼接（剪辑逻辑与 auto_edit.py 一致），
+    8. 停顿切除：片段内部（尤其是同一段连续表达里）超过 CUT_PAUSE_SEC（默认 2s）
+       既没主播说话也没游戏语音的空档，整段删掉（首尾的长空白一起收回），
+       片段会拆成几小片，成片里直接接上
+    9. 导出：默认用一条 ffmpeg 命令把各片裁剪 + 拼接 + 编码（CFR H.264/AAC）一次
+       完成——小片段多的时候这比「逐段编码 + 拼接 + 整体重编码」快且不会错位；
+       片段数超过 SINGLE_PASS_MAX_PIECES 或分片没有音轨时退回逐段编码 + 无损拼接
+    10. 旧的逐段方案（单次导出不可用时才走）：stream copy 逐段切 + concat 拼接，
        最后再整体重编码一遍成恒定帧率（CFR）：stream copy 拼出来的时间戳是
        「拼接式」的，Premiere 会按平均帧率推算导致时间错位，重编码后即对齐
        （码率上限沿用源片，画质 / 体积基本不变）
        **分片编码不一致时**（典型：一部分 HEVC、一部分 H.264）不能 stream copy，
        会把两种码流写进同一条轨道，解码器从异构段开始整段解不出来（画面可能
        冻结几十秒到十几分钟），这时自动改为「逐段重编码成统一 H.264/AAC 再拼接」
+    11. 导出后再校一次字幕时间轴：成片每片都要按帧 / 按采样取整，几十上百片
+       累加会漂零点几秒到几秒；导出完成后把成片音频解出来，用源片的音量包络
+       量出每段真实落在哪里，再分段线性插值补回去。
+       **只动时间轴，字幕文本一个字都不改。**
 
 为什么用大模型而不是纯弹幕密度:
     弹幕在「主播回答问题」时最密集，纯密度会把成片剪成问答；
@@ -78,9 +88,11 @@ import urllib.request
 import urllib.error
 import xml.etree.ElementTree as ET
 
+import numpy as np
+
 from auto_edit import (
     FFMPEG, FFPROBE, fmt_hms, require_tools, probe_duration,
-    cut_segment, concat_segments, snap_cut,
+    cut_segment, concat_segments, snap_cut, frame_rms, decode_audio_range,
 )
 
 # ---------------------------------------------------------------------------
@@ -130,6 +142,24 @@ SNAP_BOUNDARIES = True              # 开关：剪辑点是否向外扩到静音
 SNAP_MAX_SHIFT = 5.0                # 每个边界最多向外扩的秒数
 MERGE_GAP_SEC = 1.0                 # 两段间隔小于这个秒数时合并（避免来回跳）
 OVERFLOW_TOLERANCE_SEC = 30.0       # 音频对齐后允许超出成片上限的秒数（优先保完整）
+
+# ---------------------------------------------------------------------------
+# 片段内的长停顿切除
+#   一段连续的表达里，如果超过 CUT_PAUSE_SEC 秒既没主播说话、也没游戏语音，
+#   这段空白整段删掉（片段被拆成几小片，成片里直接接上）；首尾的长空白也收回来。
+#   字幕来自 ASR（主播 + 游戏配音都在里面），所以字幕之间的空档就是「没人说话」。
+# ---------------------------------------------------------------------------
+CUT_PAUSE_SEC = 2.0                 # 超过这个秒数的无声停顿整段切掉（0 = 不切）
+CUT_PAUSE_PAD_SEC = 0.25            # 切掉停顿后两端各留的余量（防止削掉字头字尾）
+CUT_PAUSE_MIN_PIECE_SEC = 1.0       # 切完剩下不足这个秒数的碎片直接丢掉
+
+# ---------------------------------------------------------------------------
+# 成片导出
+#   停顿切除后小片段会变多，逐段 stream copy 会卡在关键帧上、逐段重编码再
+#   整体重编码又要写很多中间文件；所以默认用一条 ffmpeg 命令裁剪 + 拼接 + 编码。
+# ---------------------------------------------------------------------------
+SINGLE_PASS_RENDER = True           # 开关：用一条 ffmpeg 命令直接导出成片
+SINGLE_PASS_MAX_PIECES = 40         # 展开后片数超过这个就退回逐段编码（命令行长度）
 
 # ---------------------------------------------------------------------------
 # 剪辑倾向：向「手动剪辑」样本靠拢
@@ -238,6 +268,27 @@ WRITE_OUTPUT_SRT = True             # 开关：渲染成片时额外写一份对
 MIN_OUT_SUB_SEC = 0.30              # 成片字幕最短显示时长，太短的（切点戈到的半句）丢掉
 
 # ---------------------------------------------------------------------------
+# 导出后时间轴再校正（只动时间，不动字幕文本）
+#   导出时每一片都要按帧取整（fps 滤镜 / 音频重采样取整），几十上百片累加
+#   下来，成片里的实际位置会比计划晚零点几秒到几秒（实测 261 片共 3.8s），
+#   按计划时间铺的字幕到后面就整体偏早。所以导出完成后要再量一次：
+#   把「够长、以说话为主」的片段当锚点，用它们的源音频包络和成片音频包络做
+#   相关，量出真实偏移，再沿时间轴分段线性插值，只改时间、不动文字。
+# ---------------------------------------------------------------------------
+OUT_ALIGN_ENABLED = True            # 开关：导出后是否再校正一次字幕时间轴
+OUT_ALIGN_ANCHORS = 12              # 最多拿多少个片段当锚点去测偏移
+OUT_ALIGN_MIN_PIECE_SEC = 6.0       # 太短的片段包络不够长，不当锚点
+OUT_ALIGN_MAX_SPAN_SEC = 20.0       # 每个锚点最多比对多少秒（省解码时间）
+OUT_ALIGN_MAX_SHIFT = 4.0           # 在「按时长比例估算」的偏移上下各找多少秒
+OUT_ALIGN_MIN_CORR = 0.70           # 包络相关系数低于这个就当没测到（真实锚点 0.97+）
+OUT_ALIGN_MIN_PEAK_RATIO = 1.10     # 最佳峰要比次高峰高这么多倍，防滑到别的话上
+OUT_ALIGN_OUTLIER_SEC = 0.60        # 偏离整体趋势超过这么多秒的锚点当测量错误丢掉
+OUT_ALIGN_MIN_APPLY = 0.03          # 小于这个的偏移忽略（没意义的抖动）
+OUT_ALIGN_SR = 16000                # 解码音频用的采样率
+OUT_ALIGN_FRAME = 0.06              # 音量包络帧长（秒）
+OUT_ALIGN_HOP = 0.02                # 音量包络帧移（秒），也就是对齐精度
+
+# ---------------------------------------------------------------------------
 # 大模型参数（默认 DeepSeek，OpenAI 兼容接口）
 # ---------------------------------------------------------------------------
 LLM_BASE_URL = "https://api.deepseek.com/v1"
@@ -255,8 +306,8 @@ LLM_CONTEXT_SEC = 30.0              # 每块前后各附多少秒字幕作为上
 # ---------------------------------------------------------------------------
 # 小工具
 # ---------------------------------------------------------------------------
-def log(*args):
-    print(*args, file=sys.stderr, flush=True)
+def log(*args, end="\n"):
+    print(*args, file=sys.stderr, flush=True, end=end)
 
 
 def fmt_sec(t):
@@ -973,10 +1024,14 @@ CHUNK_SYSTEM = """你是游戏直播回放的精剪助手。你会看到一段�
 
 def analyze_chunk(entries, lo, hi, danmaku_text, min_clip, max_items, edit_prompt,
                   context_sec=LLM_CONTEXT_SEC):
-    """分析一块字幕。entries 传全量字幕，本块之外的只作为上下文。"""
+    """分析一块字幕。entries 传全量字幕，本块之外的只作为上下文。
+
+    返回 (候选列表, 统计)；统计里带 raw（主播过滤前的个数）和 error（失败原因），
+    日志由调用方拼成一行打印（每块只占一行，不刷屏）。
+    """
     inside = [e for e in entries if e["end"] > lo and e["start"] < hi]
     if not inside:
-        return []
+        return [], {"raw": 0}
 
     def render(e, is_context):
         tag = "[主播]" if _speaker_entry(e) else ""
@@ -1012,19 +1067,16 @@ def analyze_chunk(entries, lo, hi, danmaku_text, min_clip, max_items, edit_promp
         raw = llm_chat(system, user)
         obj = parse_json_object(raw)
     except Exception as exc:
-        log(f"  ! 分段分析失败（{lo:.0f}-{hi:.0f}s）：{exc}")
-        return []
+        return [], {"raw": 0, "error": str(exc)}
 
     found = normalize_candidates(obj.get("items", []), inside, lo, hi, min_clip)
     found = annotate_candidates(entries, found, min_clip)
     raw_count = len(found)
     found = filter_by_streamer(found)
-    if raw_count != len(found):
-        log(f"    · 主播过滤：{raw_count} -> {len(found)} 个候选")
     found.sort(key=lambda x: -x["score"])
     found = found[:max_items]
     found.sort(key=lambda x: x["start"])
-    return found
+    return found, {"raw": raw_count}
 
 
 # ---------------------------------------------------------------------------
@@ -1604,6 +1656,131 @@ def merge_segments(segments, gap=MERGE_GAP_SEC):
     return merged
 
 
+def cut_pauses(segments, entries, min_pause=CUT_PAUSE_SEC,
+               pad=CUT_PAUSE_PAD_SEC, min_piece=CUT_PAUSE_MIN_PIECE_SEC):
+    """把片段内部「既没主播、也没游戏语音」的长停顿整段切掉。
+
+    字幕来自 ASR（主播和游戏配音都在里面），所以两条字幕之间的空档就是
+    没人说话的地方：超过 min_pause 秒的空档整段删掉，两侧各留 pad 秒，
+    于是原来的一段会拆成几小片，成片里直接接上（节奏更紧）。
+    片段首尾的长空白同样收回到最后一句 + pad，不留大段空白。
+    返回 (新片段列表, 统计)。
+    """
+    if min_pause <= 0 or not segments:
+        return segments, {"from": len(segments), "pieces": len(segments),
+                          "removed": 0.0}
+
+    before = sum(_dur(s) for s in segments)
+    out = []
+    for seg in segments:
+        s0, e0 = float(seg["start"]), float(seg["end"])
+        s, e = s0, e0
+        spans = []
+        for x in entries:
+            a, b = max(float(x["start"]), s), min(float(x["end"]), e)
+            if b - a <= 0.01:
+                continue
+            if spans and a <= spans[-1][1]:
+                spans[-1][1] = max(spans[-1][1], b)
+            else:
+                spans.append([a, b])
+        if not spans:
+            continue                       # 整段没人说话：没有内容，直接丢掉
+
+        # 首尾的长空白收回来
+        if spans[0][0] - s > min_pause:
+            s = max(s, spans[0][0] - pad)
+        if e - spans[-1][1] > min_pause:
+            e = min(e, spans[-1][1] + pad)
+
+        # 中间的停顿：从空档里断开，一段变几片
+        pieces, cursor, prev_end = [], s, None
+        for a, b in spans:
+            if prev_end is not None and a - prev_end > min_pause:
+                pieces.append((cursor, prev_end + pad))
+                cursor = max(s, a - pad)
+            prev_end = b if prev_end is None else max(prev_end, b)
+        pieces.append((cursor, e))
+
+        for ps, pe in pieces:
+            ps, pe = max(float(ps), s), min(float(pe), e)
+            if pe - ps < min_piece:
+                continue                   # 切剩下的碎渣（几乎没有内容）
+            item = dict(seg)
+            item["start"], item["end"] = ps, pe
+            item["span_start"], item["span_end"] = s0, e0
+            if item.get("orig_start") is not None:
+                item["orig_start"] = max(float(item["orig_start"]), ps)
+            if item.get("orig_end") is not None:
+                item["orig_end"] = min(float(item["orig_end"]), pe)
+            if len(pieces) > 1:
+                item["pause_split"] = True
+            out.append(item)
+
+    after = sum(_dur(s) for s in out)
+    return out, {"from": len(segments), "pieces": len(out),
+                 "removed": max(0.0, before - after)}
+
+
+def group_segments(segments):
+    """把停顿切除拆出来的多片按「原片段」归组（日志 / 计划文本用，保持时间顺序）。
+
+    cut_pauses()/top_up_segments() 拆出来的每一片都复制原片段的字典，
+    所以同一段拆出来的各片 id 相同，直接按 id 归组即可；
+    没有 id 时（老计划）退回用「标题 + 类型 + 起点」当键。
+    """
+    groups, order = {}, []
+    for seg in segments:
+        key = seg.get("id")
+        if key is None:
+            key = ("无id", seg.get("title") or "", seg.get("type") or "",
+                   round(float(seg["start"]), 1))
+        if key not in groups:
+            groups[key] = []
+            order.append(key)
+        groups[key].append(seg)
+    return [groups[k] for k in order]
+
+
+def top_up_segments(segments, pool, entries, target_min, target_max,
+                    min_clip, pause_sec=CUT_PAUSE_SEC):
+    """停顿切除把成片削短了的话，从候选池里按「分数 + 主播占比」继续补。
+
+    补进来的候选同样做停顿切除；和已有片段重叠的、或会让总时长冲过上限的跳过。
+    返回 (新片段列表, 补进来的秒数)。
+    """
+    if not pool or pause_sec < 0:
+        return segments, 0.0
+    total = sum(_dur(s) for s in segments)
+    used = {s.get("id") for s in segments if s.get("id") is not None}
+    order = sorted((c for c in pool if c.get("id") not in used),
+                   key=lambda c: -(float(c.get("score", 5))
+                                   + 4.0 * float(c.get("streamer_ratio") or 0)))
+    added, extra = [], 0.0
+    for cand in order:
+        if total >= target_min:
+            break
+        if _dur(cand) < min_clip:
+            continue
+        pieces, _ = cut_pauses([dict(cand)], entries, pause_sec)
+        if not pieces:
+            continue
+        gain = sum(_dur(p) for p in pieces)
+        if total + gain > target_max and total >= target_min:
+            continue
+        occupied = segments + added
+        if any(not (p["end"] <= s["start"] or p["start"] >= s["end"])
+               for p in pieces for s in occupied):
+            continue
+        for p in pieces:
+            added.append(p)
+        total += gain
+        extra += gain
+    if not added:
+        return segments, 0.0
+    return sorted(segments + added, key=lambda s: (s["start"], s["end"])), extra
+
+
 def enforce_duration(segments, target_min, target_max, min_clip):
     """外扩可能把总时长顶出上限；尽量只收回多扩的部分，保住整段。"""
     segs = [dict(s) for s in segments]
@@ -1913,17 +2090,172 @@ def cut_segment_reencoded(src, start, duration, dst, target, src_info=None,
 # ---------------------------------------------------------------------------
 # 剪辑（复用 auto_edit 的 stream copy 逻辑）
 # ---------------------------------------------------------------------------
+def render_single_pass(pieces, out_path, crf=REENCODE_CRF,
+                       preset=REENCODE_PRESET,
+                       maxrate_ratio=REENCODE_MAXRATE_RATIO,
+                       faststart=True):
+    """一条 ffmpeg 命令导出成片：每片各自 -ss/-t 输入，滤镜里 concat，只编码一次。
+
+    为什么这样导出：
+        停顿切除后一段常被拆成好几小片，逐段 stream copy 会卡在关键帧上
+        （多带一个 GOP、长度对不上），逐段重编码再整体重编码又要写一堆
+        中间文件、还多一次画质损失。这里让 ffmpeg 一次裁完、拼完、编码完，
+        输出直接是 CFR 的 H.264/AAC，Premiere 也不会时间错位。
+    输入是 (段序号, part, 局部起点, 局部终点) 的列表（跨分片已经拆好）。
+    返回 timeline（每片在成片里的位置），供生成对齐字幕用。
+    """
+    if not pieces:
+        return []
+
+    sig = {}
+    for _, part, _, _ in pieces:
+        if part["path"] not in sig:
+            sig[part["path"]] = probe_signature(part["path"])
+    no_audio = [p for p, info in sig.items() if not info.get("has_audio")]
+    if no_audio:
+        raise RuntimeError(f"分片没有音轨，单次导出不支持: "
+                           f"{os.path.basename(no_audio[0])}")
+
+    first = sig[pieces[0][1]["path"]]
+    width = first["width"] or 1920
+    height = first["height"] or 1080
+    fps_expr = first["fps_expr"] or "30"
+    a_rate = first["a_rate"] or 48000
+    a_channels = first["a_channels"] or 2
+    layout = {1: "mono", 2: "stereo"}.get(a_channels)
+    src_info = probe_streams(pieces[0][1]["path"])
+
+    tmp_dir = tempfile.mkdtemp(prefix="edit_caption_sp_")
+    try:
+        lines, refs = [], []
+        for k, (_, part, ls, le) in enumerate(pieces):
+            info = sig[part["path"]]
+            vf = ["setpts=PTS-STARTPTS"]
+            if (info["width"], info["height"]) != (width, height):
+                vf.append(f"scale={width}:{height}:flags=bicubic")
+            vf += [f"fps={fps_expr}", "setsar=1", "format=yuv420p"]
+            lines.append(f"[{k}:v:0]" + ",".join(vf) + f"[v{k}]")
+
+            af = ["asetpts=PTS-STARTPTS", f"aresample={a_rate}"]
+            if layout:
+                af.append(f"aformat=sample_fmts=fltp:channel_layouts={layout}")
+            lines.append(f"[{k}:a:0]" + ",".join(af) + f"[a{k}]")
+            refs.append(f"[v{k}][a{k}]")
+        lines.append("".join(refs) + f"concat=n={len(pieces)}:v=1:a=1[vout][aout]")
+        graph = ";".join(lines)
+
+        cmd = [FFMPEG, "-hide_banner", "-loglevel", "error", "-y"]
+        for _, part, ls, le in pieces:
+            # -ss / -t 放在 -i 前面 = 输入侧定位，编码时帧精确、且只解码这一段
+            cmd += ["-ss", f"{ls:.3f}", "-t", f"{le - ls:.3f}", "-i", part["path"]]
+        # 滤镜图直接写在命令行里（ffmpeg 8+ 删掉了 -filter_complex_script，
+        # 命令行也装不下更长的东西；片数上限 SINGLE_PASS_MAX_PIECES 就是为此设的）
+        if len(graph) + sum(len(x) for x in cmd) > 28000:
+            raise RuntimeError("滤镜图太长，命令行装不下")
+        cmd += ["-filter_complex", graph,
+                "-map", "[vout]", "-map", "[aout]",
+                "-c:v", "libx264", "-preset", preset,
+                "-crf", f"{float(crf):g}", "-pix_fmt", "yuv420p",
+                "-fps_mode", "cfr", "-r", str(fps_expr)]
+        v_bitrate = src_info.get("v_bitrate") or 0
+        if v_bitrate > 0:
+            cap = int(v_bitrate * float(maxrate_ratio))
+            cmd += ["-maxrate", str(cap), "-bufsize", str(cap * 2)]
+        abr = int(src_info.get("a_bitrate") or 0) or 128000
+        abr = min(max(abr, 96000), 320000)
+        cmd += ["-c:a", "aac", "-b:a", str(abr),
+                "-ar", str(a_rate), "-ac", str(a_channels)]
+        cmd += ["-avoid_negative_ts", "make_zero"]
+        if faststart and os.path.splitext(out_path)[1].lower() in (".mp4", ".mov", ".m4v"):
+            cmd += ["-movflags", "+faststart"]
+        cmd.append(out_path)
+
+        proc = subprocess.run(cmd)
+        if proc.returncode != 0:
+            raise RuntimeError(f"ffmpeg 单次导出失败（退出码 {proc.returncode}）")
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    timeline, cursor = [], 0.0
+    for i, part, ls, le in pieces:
+        length = le - ls
+        timeline.append({
+            "seg": i,
+            "global_start": part["offset"] + ls,
+            "length": length,
+            "actual": length,
+            "shift": 0.0,
+            "out_start": cursor,
+        })
+        cursor += length
+    return timeline
+
+
+def render_batched(pieces, out_path, crf=REENCODE_CRF, preset=REENCODE_PRESET,
+                   batch=SINGLE_PASS_MAX_PIECES):
+    """片段很多（一条命令装不下）时：分批单次导出，再无损拼接。
+
+    每批都是同一套编码参数（宽高 / 帧率 / H.264 + AAC），所以批之间可以
+    直接 `-c copy` 拼起来，不需要再整体重编码一遍。
+    """
+    tmp_dir = tempfile.mkdtemp(prefix="edit_caption_batch_")
+    timeline, outs, cursor = [], [], 0.0
+    try:
+        ext = os.path.splitext(out_path)[1].lower() or ".mp4"
+        total_batches = (len(pieces) + batch - 1) // batch
+        for n, start in enumerate(range(0, len(pieces), batch), 1):
+            group = pieces[start:start + batch]
+            dst = os.path.join(tmp_dir, f"batch_{n:03d}{ext}")
+            log(f"  批次 {n}/{total_batches}：{len(group)} 片")
+            part_timeline = render_single_pass(group, dst, crf=crf,
+                                               preset=preset, faststart=False)
+            for item in part_timeline:
+                item["out_start"] += cursor
+                timeline.append(item)
+            cursor += sum(item["length"] for item in part_timeline)
+            outs.append(dst)
+
+        log(f"拼接 {len(outs)} 批 -> {out_path}")
+        list_path = os.path.join(tmp_dir, "batches.txt")
+        concat_segments(outs, out_path, list_path)
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+    return timeline
+
+
 def render(parts, segments, out_path, keep_temp=False,
-           reencode=REENCODE_OUTPUT, crf=REENCODE_CRF):
+           reencode=REENCODE_OUTPUT, crf=REENCODE_CRF,
+           single_pass=SINGLE_PASS_RENDER):
     """按全局区间逐段切（跨分片自动拆），再依次拼接，最后整体重编码成 CFR。
 
     返回 timeline：每段在实际成片里的位置，供生成对齐字幕用。
     stream copy 只能从关键帧开始切，实际起点可能比请求的早一个 GOP，
     所以这里逐段记录「实际时长 / 实际提前量」，字幕才能跟着对齐。
+    默认优先走单次导出（或分批导出）：停顿切除后片段小而多，逐段编码再整体
+    重编码既慢又容易错位。
     """
     tmp_dir = tempfile.mkdtemp(prefix="edit_caption_")
     timeline = []
     try:
+        # ---- 优先走单次 / 分批导出：ffmpeg 裁 + 拼 + 编码，不落小中间文件 ----
+        flat = []
+        for i, seg in enumerate(segments, 1):
+            for part, ls, le in map_segment_to_parts(parts, seg["start"], seg["end"]):
+                if le - ls > 0.02:
+                    flat.append((i, part, ls, le))
+        if single_pass and flat:
+            batches = (len(flat) + SINGLE_PASS_MAX_PIECES - 1) // SINGLE_PASS_MAX_PIECES
+            how = ("单次 ffmpeg" if batches == 1
+                   else f"分批 ffmpeg（{batches} 批）")
+            log(f"导出     : {how}，{len(segments)} 段 / {len(flat)} 片，"
+                f"裁剪 + 拼接 + 编码")
+            try:
+                if batches == 1:
+                    return render_single_pass(flat, out_path, crf=crf)
+                return render_batched(flat, out_path, crf=crf)
+            except RuntimeError as exc:
+                log(f"  ! 单次导出不可用，改用逐段编码 + 无损拼接：{exc}")
+
         # 分片码流不一致（典型：HEVC 与 H.264 混用）时，stream copy 的 concat
         # 会把两种码流写进同一条轨道，解码器从第一个异构片段开始就整段解不出来，
         # 播放器 / Premiere 只能一直冻在上一帧（实测能冻十几分钟）。
@@ -2060,37 +2392,67 @@ def load_plan(path, duration=None):
 
 
 def save_plan(segments, out_path, parts=None):
+    """写剪辑计划。
+
+    .plan.json 保持「逐片」（停顿切除会把一段拆成几片，渲染要按片来）；
+    .plan.txt 按「原片段」归组，同一段只写一条，下面列出它被切成哪几片，
+    免得同一个标题 / 理由在文件里重复几十遍。
+    """
     base = os.path.splitext(out_path)[0]
     with open(base + ".plan.json", "w", encoding="utf-8") as f:
         json.dump(segments, f, ensure_ascii=False, indent=2)
+
+    def piece_line(seg):
+        line = (f"{fmt_hms(seg['start'])} ~ {fmt_hms(seg['end'])}"
+                f"  ({_dur(seg):.1f}s")
+        if seg.get("orig_start") is not None:
+            ds = seg["start"] - seg["orig_start"]
+            de = seg["end"] - seg.get("orig_end", seg["end"])
+            if abs(ds) > 0.05 or abs(de) > 0.05:
+                line += f"，对齐 {ds:+.1f}/{de:+.1f}s"
+        return line + ")"
+
     with open(base + ".plan.txt", "w", encoding="utf-8", newline="\n") as f:
-        for i, seg in enumerate(segments, 1):
-            f.write(f"{i:02d}  {fmt_hms(seg['start'])} ~ {fmt_hms(seg['end'])}"
-                    f"  ({seg['end'] - seg['start']:.1f}s)"
-                    f"  score={seg.get('score', 0):.0f}\n")
-            if seg.get("title"):
-                f.write(f"    标题: {seg['title']}\n")
-            if seg.get("reason"):
-                f.write(f"    理由: {seg['reason']}\n")
-            if seg.get("text"):
-                f.write(f"    台词: {seg['text']}\n")
-            if seg.get("type"):
-                f.write(f"    类型: {seg['type']}\n")
-            if seg.get("streamer_ratio") is not None:
-                f.write(f"    主播说话: {seg['streamer_ratio'] * 100:.0f}%\n")
-            if seg.get("ctx_sec"):
-                f.write(f"    上文补齐: {seg['ctx_sec']:+.1f}s"
-                        f"（{seg.get('ctx_reason', '')}）\n")
-            if seg.get("orig_start") is not None:
-                ds = seg["start"] - seg["orig_start"]
-                de = seg["end"] - seg.get("orig_end", seg["end"])
+        for i, pieces in enumerate(group_segments(segments), 1):
+            head = pieces[0]
+            start = min(float(p["start"]) for p in pieces)
+            end = max(float(p["end"]) for p in pieces)
+            dur = sum(_dur(p) for p in pieces)
+            split = f"  {len(pieces)} 片" if len(pieces) > 1 else ""
+            f.write(f"{i:02d}  {fmt_hms(start)} ~ {fmt_hms(end)}"
+                    f"  共 {dur:.1f}s{split}"
+                    f"  score={head.get('score', 0):.0f}\n")
+            if head.get("title"):
+                f.write(f"    标题: {head['title']}\n")
+            if head.get("reason"):
+                f.write(f"    理由: {head['reason']}\n")
+            if head.get("text"):
+                f.write(f"    台词: {head['text']}\n")
+            if head.get("type"):
+                f.write(f"    类型: {head['type']}\n")
+            if head.get("streamer_ratio") is not None:
+                f.write(f"    主播说话: {head['streamer_ratio'] * 100:.0f}%\n")
+            if head.get("ctx_sec"):
+                f.write(f"    上文补齐: {head['ctx_sec']:+.1f}s"
+                        f"（{head.get('ctx_reason', '')}）\n")
+            if len(pieces) > 1:
+                f.write(f"    切断: 去掉了 {len(pieces) - 1} 处无声停顿，"
+                        f"原区间 {fmt_hms(head.get('span_start', start))} ~ "
+                        f"{fmt_hms(head.get('span_end', end))}\n")
+                f.write("    片:\n")
+                for p in pieces:
+                    f.write(f"      {piece_line(p)}\n")
+            elif head.get("orig_start") is not None:
+                ds = head["start"] - head["orig_start"]
+                de = head["end"] - head.get("orig_end", head["end"])
                 if abs(ds) > 0.05 or abs(de) > 0.05:
                     f.write(f"    音频对齐: 起点 {ds:+.1f}s, 终点 {de:+.1f}s\n")
             if parts and len(parts) > 1:
-                for part, ls, le in map_segment_to_parts(
-                        parts, seg["start"], seg["end"]):
-                    f.write(f"    来源: {part['name']} "
-                            f"{fmt_hms(ls)} ~ {fmt_hms(le)}\n")
+                for p in pieces:
+                    for part, ls, le in map_segment_to_parts(
+                            parts, p["start"], p["end"]):
+                        f.write(f"    来源: {part['name']} "
+                                f"{fmt_hms(ls)} ~ {fmt_hms(le)}\n")
             f.write("\n")
     log(f"剪辑计划: {base}.plan.txt")
 
@@ -2110,16 +2472,20 @@ def fmt_srt_time(seconds):
 def build_output_subtitles(entries, timeline, min_dur=MIN_OUT_SUB_SEC):
     """按实际剪辑结果，把字幕重映射到成片时间轴。
 
-    timeline 来自 render()：每段记录了请求的源区间、实际提前量、成片起点。
+    timeline 来自 render()（可选再经 align_output_timeline() 校正）：每段记录了
+    请求的源区间、实际提前量（shift）、导出后实测偏移（align）、成片起点。
     跨边界的字幕会被裁到片段内；裁完不足 min_dur 的（切点戈到的半句）丢掉。
+    字幕文本原样搬运，只改时间。
     """
     out = []
     for piece in timeline:
         src_lo = float(piece["global_start"])
         src_hi = src_lo + float(piece["length"])
         # 成片里这一段的内容从 out_start 开始，但前 shift 秒是 keyframe 多带的前文，
-        # 所以源时间 src_lo 实际对应成片时间 out_start + shift
-        out_lo = float(piece["out_start"]) + float(piece.get("shift", 0.0))
+        # 所以源时间 src_lo 实际对应成片时间 out_start + shift；
+        # align 是导出后拿成片音频和字幕对出来的残余偏移
+        out_lo = max(0.0, float(piece["out_start"]) + float(piece.get("shift", 0.0))
+                     + float(piece.get("align", 0.0)))
         for e in entries:
             s = max(float(e["start"]), src_lo)
             t = min(float(e["end"]), src_hi)
@@ -2148,6 +2514,265 @@ def write_srt_file(subtitles, path):
             f.write(f"{i}\n{fmt_srt_time(s['start'])} --> "
                     f"{fmt_srt_time(s['end'])}\n{s['text']}\n\n")
     return len(subtitles)
+
+
+# ---------------------------------------------------------------------------
+# 导出后时间轴再校正：拿成片音频把每一片的真实位置量出来，只改时间、不改文本
+#   为什么需要：导出时每片都要按帧取整（fps 滤镜）、音频也要按采样取整，
+#   几十上百片累加下来，成片里的实际位置会比计划晚零点几秒到几秒
+#   （实测 261 片共 3.8s）——按计划时间铺的成片字幕到后面就整体偏早。
+#   为什么不能只按「字幕说话区 vs 音量」对：成片剪完以后语音是连续的
+#   （93% 的时间都在说话），模板没有区分度，实测会把偏移判成随机的 ±2s。
+#   所以改成「源片音频 vs 成片音频」的包络相关：同一段话的响度起伏是唯一
+#   的，实测相关系数 0.87~1.00，能稳定量到 20ms 精度。
+# ---------------------------------------------------------------------------
+def _decode_output_audio(path, sr=OUT_ALIGN_SR):
+    """把成片音频一次性解码成 sr 单声道原始 PCM，返回 (memmap, 临时文件路径)。
+
+    逐片解码要为每一片启动一次 ffmpeg（几十上百次），这里只解码一次，
+    再按片从映射文件里切片，快很多、内存也不涨。
+    """
+    fd, tmp = tempfile.mkstemp(prefix="edit_caption_audio_", suffix=".s16")
+    os.close(fd)
+    cmd = [FFMPEG, "-hide_banner", "-loglevel", "error", "-y",
+           "-i", path, "-vn", "-sn", "-dn",
+           "-ac", "1", "-ar", str(sr), "-f", "s16le", tmp]
+    proc = subprocess.run(cmd)
+    if proc.returncode != 0 or os.path.getsize(tmp) <= 0:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise RuntimeError("成片没有可解码的音频")
+    return np.memmap(tmp, dtype=np.int16, mode="r"), tmp
+
+
+def _envelope(samples, sr=OUT_ALIGN_SR):
+    """音量包络（RMS）。AAC 重编码会改波形幅度，但包络形状基本一致。"""
+    _, rms = frame_rms(samples, sr=sr, frame=OUT_ALIGN_FRAME,
+                       hop=OUT_ALIGN_HOP)
+    return rms
+
+
+def _correlate_envelope(src, out, center, radius):
+    """在 out（成片）包络里找 src（源片）包络的位置。
+
+    返回 (src 起点在 out 里的位置秒, 相关系数)；只接受 |位置 − center| ≤ radius。
+    用 Pearson 相关而不是差值：两边音量档位可能被重编码改过，形状才是判据。
+    """
+    n = int(src.size)
+    if n < 8 or out.size < n:
+        return None
+    a = src - float(src.mean())
+    b = out - float(out.mean())
+    sa = float(np.dot(a, a))
+    if sa <= 1e-18:
+        return None                      # 整段是数字静音，无从对齐
+    cs = np.concatenate(([0.0], np.cumsum(b * b)))
+    full = np.correlate(b, a, mode="full")
+    starts = np.arange(full.size) - (n - 1)
+    keep = (starts >= 0) & (starts + n <= b.size)
+    idx = np.flatnonzero(keep)
+    if not idx.size:
+        return None
+    energy = cs[starts[idx] + n] - cs[starts[idx]]
+    corr = full[idx] / np.sqrt(np.maximum(energy, 1e-30) * sa)
+    pos = starts[idx] * OUT_ALIGN_HOP
+    sel = np.abs(pos - center) <= radius
+    if not sel.any():
+        return None
+    k = int(np.argmax(np.where(sel, corr, -2.0)))
+    best = float(corr[k])
+    # 次高峰：离最佳位置 0.3s 以外的最大值，用来判断这个峰是不是唯一的
+    others = corr[np.abs(pos - pos[k]) > 0.3]
+    second = float(others.max()) if others.size else 0.0
+    return float(pos[k]), best, second
+
+
+def _reject_outliers(points):
+    """丢掉明显不合群的锚点：偏移应该随成片时间平滑增长。"""
+    if len(points) <= 2:
+        return points
+    xs = np.asarray([x for x, _ in points], dtype=np.float64)
+    ys = np.asarray([y for _, y in points], dtype=np.float64)
+    slope = float((xs * ys).sum() / max(float((xs * xs).sum()), 1e-9))
+    keep = np.abs(ys - slope * xs) <= OUT_ALIGN_OUTLIER_SEC
+    kept = [p for p, k in zip(points, keep) if k]
+    return kept if len(kept) >= 2 else points
+
+
+def _speech_seconds(entries, starts, lo, hi):
+    """[lo, hi] 里字幕（也就是说话）覆盖的秒数。starts 是 entries 的起点表。"""
+    i = bisect.bisect_left(starts, lo - 1.0)
+    total = 0.0
+    while i < len(entries) and entries[i]["start"] < hi:
+        a = max(float(entries[i]["start"]), lo)
+        b = min(float(entries[i]["end"]), hi)
+        if b > a:
+            total += b - a
+        i += 1
+    return total
+
+
+def _pick_anchors(timeline, entries):
+    """挑锚点：够长、大半时间在说话（包络才有特征），沿时间轴均匀分布。"""
+    starts = [float(e["start"]) for e in entries]
+    rows = []
+    for p in timeline:
+        length = float(p["length"])
+        if length < OUT_ALIGN_MIN_PIECE_SEC:
+            continue
+        lo = float(p["global_start"])
+        if _speech_seconds(entries, starts, lo, lo + length) < length * 0.5:
+            continue                     # 大半是纯游戏声，特征不明显且没意义
+        rows.append(p)
+    if len(rows) > OUT_ALIGN_ANCHORS:
+        step = (len(rows) - 1) / float(max(OUT_ALIGN_ANCHORS - 1, 1))
+        picks = []
+        for i in range(OUT_ALIGN_ANCHORS):
+            p = rows[int(round(i * step))]
+            if not picks or picks[-1] is not p:
+                picks.append(p)
+        rows = picks
+    return rows
+
+
+def _measure_anchor(parts, piece, audio, sr, out_dur, ratio):
+    """量一个锚点：返回 (实际偏移秒, 相关系数)，量不到返回 None。
+
+    偏移 = 这一片的源内容在成片里比计划晚了多少秒。
+    """
+    span = min(float(piece["length"]), OUT_ALIGN_MAX_SPAN_SEC)
+    src_lo = float(piece["global_start"])
+    piece_part = parts[_part_index_at(parts, src_lo)]
+    if src_lo + span > piece_part["offset"] + piece_part["duration"] + 0.05:
+        return None                      # 跨分片的片段不做锚点
+    try:
+        src = _envelope(decode_audio_range(
+            piece_part["path"], src_lo - piece_part["offset"], span), sr)
+    except Exception:
+        return None
+
+    out_start = float(piece["out_start"])
+    est = (ratio - 1.0) * out_start     # 按时长比例估的偏移，作为搜索中心
+    # 窗口要按「估计偏移」两边都留够，否则内容整体后移时会被窗口末尾切掉
+    lo = max(0.0, out_start + est - OUT_ALIGN_MAX_SHIFT - 1.0)
+    hi = min(out_dur, out_start + est + span + 1.0)
+    i0, i1 = int(round(lo * sr)), int(round(hi * sr))
+    if i1 - i0 < int(span * sr):
+        return None
+    out = _envelope(np.asarray(audio[i0:i1], dtype=np.float32) / 32768.0, sr)
+    found = _correlate_envelope(src, out, est + out_start - lo,
+                                OUT_ALIGN_MAX_SHIFT)
+    if not found:
+        return None
+    pos, best, second = found
+    if best < OUT_ALIGN_MIN_CORR or best < second * OUT_ALIGN_MIN_PEAK_RATIO:
+        return None                      # 对不准 / 有多个一样像的位置，不采信
+    return lo + pos - out_start, best
+
+
+def align_output_timeline(timeline, entries, out_path, parts=None,
+                          max_shift=OUT_ALIGN_MAX_SHIFT, sr=OUT_ALIGN_SR):
+    """导出完成后，把每一片在成片里的真实位置量出来，修正时间轴（不动文字）。
+
+    做法：
+      1. 成片音频解码一次（memmap，不占内存）；
+      2. 挑几个「够长、以说话为主」的片段当锚点，用源片包络在成片音频里
+         找它真正落在哪，得到「这一片比计划晚了多少秒」；
+      3. 锚点之间分段线性插值 → 每一片的偏移，写进 timeline 的 align 字段
+         （build_output_subtitles 会加上去）；
+      4. 一个锚点都测不到时，退回「按时长比例整体缩放」（量出来的总时长差）。
+    字幕文本、条数、顺序都不变；任何一步出错都退回原 timeline，
+    绝不因为「字幕对齐」这种锦上添花的事把成片流程弄挂。
+    """
+    stat = {"anchors": 0, "moved": 0, "max": 0.0, "drift": 0.0, "mode": "off"}
+    if not OUT_ALIGN_ENABLED or not timeline or max_shift <= 0:
+        return timeline, stat
+
+    nominal = max(float(p["out_start"]) + float(p["length"]) for p in timeline)
+    audio, tmp = None, None
+    try:
+        try:
+            out_dur = probe_duration(out_path) or nominal
+        except Exception:
+            out_dur = nominal
+        try:
+            audio, tmp = _decode_output_audio(out_path, sr)
+            if audio.size:
+                out_dur = audio.size / float(sr)
+        except Exception as exc:
+            audio = None
+            log(f"字幕时间轴: 读不到成片音频（{exc}），只按时长比例校正")
+
+        drift = out_dur - nominal
+        stat["drift"] = drift
+        ratio = (out_dur / nominal) if nominal > 0 else 1.0
+
+        points = []
+        if audio is not None and parts and entries:
+            anchors = []
+            for piece in _pick_anchors(timeline, entries):
+                got = _measure_anchor(parts, piece, audio, sr, out_dur, ratio)
+                if got is None:
+                    continue
+                offset, _corr = got
+                anchors.append((float(piece["out_start"]) +
+                                min(float(piece["length"]),
+                                    OUT_ALIGN_MAX_SPAN_SEC) / 2.0, offset))
+            anchors = _reject_outliers(anchors)
+            stat["anchors"] = len(anchors)
+            if anchors:
+                # 成片第 0 秒必然对得上，末尾按实测总时长收口
+                points = [(0.0, 0.0)] + anchors + [(nominal, drift)]
+
+        stat["mode"] = "audio" if stat["anchors"] else "scale"
+        if points:
+            xs = np.asarray([x for x, _ in points], dtype=np.float64)
+            ys = np.asarray([y for _, y in points], dtype=np.float64)
+            order = np.argsort(xs)
+            xs, ys = xs[order], ys[order]
+            keep = np.concatenate(([True], np.diff(xs) > 1e-6))
+            xs, ys = xs[keep], ys[keep]
+            if drift >= 0:                 # 越往后只会越晚（反之亦然）
+                ys = np.maximum.accumulate(ys)
+            else:
+                ys = np.minimum.accumulate(ys)
+
+        out = []
+        for piece in timeline:
+            item = dict(piece)
+            t = float(piece["out_start"])
+            if points:
+                offset = float(np.interp(t, xs, ys))
+            else:
+                offset = (ratio - 1.0) * t
+            if np.isfinite(offset) and abs(offset) >= OUT_ALIGN_MIN_APPLY:
+                item["align"] = round(offset, 3)
+                stat["moved"] += 1
+                stat["max"] = max(stat["max"], abs(offset))
+            out.append(item)
+
+        how = (f"锚点 {stat['anchors']} 个做音频对齐" if stat["mode"] == "audio"
+               else "锚点测不到，按时长比例缩放")
+        log(f"字幕时间轴: 计划 {nominal:.2f}s / 成片 {out_dur:.2f}s"
+            f"（累计差 {drift:+.2f}s），{how}，{stat['moved']} 片校正"
+            f"（最大 {stat['max']:.2f}s）")
+        return out, stat
+    except Exception as exc:
+        log(f"字幕时间轴: 校正失败，沿用原时间轴（{exc}）")
+        return timeline, stat
+    finally:
+        if audio is not None:
+            try:
+                audio._mmap.close()
+            except Exception:
+                pass
+        if tmp and os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
 
 
 # ---------------------------------------------------------------------------
@@ -2213,6 +2838,12 @@ def main():
                         help=f"剪辑点向外找静音时最多扩的秒数，默认 {SNAP_MAX_SHIFT:g}")
     parser.add_argument("--no-snap", action="store_true",
                         help="关闭剪辑点音频对齐（不向外扩边界）")
+    parser.add_argument("--cut-pause", type=float, default=CUT_PAUSE_SEC,
+                        help=f"片段内部超过这个秒数的无声停顿整段切掉，"
+                             f"默认 {CUT_PAUSE_SEC:g}（0 = 不切）")
+    parser.add_argument("--no-cut-pause", dest="cut_pause",
+                        action="store_const", const=0.0,
+                        help="不切片段内部的长停顿")
     # 兼容旧命令行：--no-correct / --correct 已不起作用（纠错搬到 sensevoice_srt.py）
     parser.add_argument("--no-correct", dest="correct", action="store_false",
                         default=None, help=argparse.SUPPRESS)
@@ -2224,6 +2855,13 @@ def main():
     parser.add_argument("--no-output-srt", dest="write_srt",
                         action="store_false", default=WRITE_OUTPUT_SRT,
                         help="不生成对齐到成片的字幕")
+    parser.add_argument("--no-out-align", dest="out_align",
+                        action="store_false", default=OUT_ALIGN_ENABLED,
+                        help="导出后不再用成片音频校正字幕时间轴")
+    parser.add_argument("--out-align-shift", type=float,
+                        default=OUT_ALIGN_MAX_SHIFT,
+                        help=f"导出后每片最多校正多少秒，默认 "
+                             f"{OUT_ALIGN_MAX_SHIFT:g}（0 = 不校正）")
     parser.add_argument("--dry-run", action="store_true",
                         help="只分析并输出计划，不渲染视频")
     parser.add_argument("--keep-temp", action="store_true",
@@ -2234,6 +2872,9 @@ def main():
                              "时间戳可能让 Premiere 时间错位）")
     parser.add_argument("--reencode-crf", type=float, default=REENCODE_CRF,
                         help=f"重编码画质档位，默认 {REENCODE_CRF:g}")
+    parser.add_argument("--no-single-pass", dest="single_pass",
+                        action="store_false", default=SINGLE_PASS_RENDER,
+                        help="不用单次导出，改回「逐段编码 + 无损拼接」")
     args = parser.parse_args()
 
     if not SNAP_BOUNDARIES:
@@ -2244,6 +2885,10 @@ def main():
     PROFILE["streamer_target"] = max(0.0, min(float(args.streamer_target), 1.0))
     PROFILE["min_clip_streamer"] = max(0.0, min(float(args.min_clip_streamer), 1.0))
     PROFILE["trim_streamer"] = bool(args.trim_streamer)
+
+    if not args.reencode and args.single_pass:
+        # 单次导出本身就必然重编码；用户明确要 stream copy 就关掉它
+        args.single_pass = False
 
     require_tools()
 
@@ -2332,8 +2977,12 @@ def main():
     log(f"弹幕     : {'开' if args.use_danmaku else '关'}（{args.danmaku}）")
     log("音频对齐 : " + (f"开（边界向外扩 ≤ {args.snap_shift:g}s 找静音）"
                           if not args.no_snap and args.snap_shift > 0 else "关"))
+    log("停顿切除 : " + (f"开（段内 > {args.cut_pause:g}s 的无声停顿整段切掉，"
+                          f"两端各留 {CUT_PAUSE_PAD_SEC:g}s）"
+                          if args.cut_pause > 0 else "关"))
     if plan_segments:
-        log(f"剪辑计划 : {plan_path}（{len(plan_segments)} 段，跳过 AI 分析）")
+        log(f"剪辑计划 : {plan_path}（{len(group_segments(plan_segments))} 段 / "
+            f"{len(plan_segments)} 片，跳过 AI 分析）")
     log(f"目标成片 : {fmt_hms(args.target_min)} ~ {fmt_hms(args.target_max)}"
         f"，单段 >= {args.min_clip:g}s")
     log(f"提示词   : {args.prompt or '（空）'}")
@@ -2375,9 +3024,11 @@ def main():
         chunks = build_chunks(entries, args.chunk_sec)
         log(f"字幕分块 : {len(chunks)} 块（每块 {args.chunk_sec:g}s）")
 
+    pool = []
     if plan_segments:
         # ---- 直接使用现成计划：不做分块分析 / 全局挑选 ----
-        log(f"按计划剪辑 : {len(plan_segments)} 段，跳过 AI 分析与挑选")
+        log(f"按计划剪辑 : {len(group_segments(plan_segments))} 段 / "
+            f"{len(plan_segments)} 片，跳过 AI 分析与挑选")
         segments = plan_segments
     else:
         # ---- 分块分析 ----
@@ -2391,17 +3042,24 @@ def main():
 
             danmaku_text = (format_danmaku(buckets, lo, hi)
                             if args.use_danmaku else "（未启用弹幕）")
+            # 每块只占一行：先打前缀（大模型请求可能要几十秒，保留进度感），
+            # 拿到结果后把「候选 N 个」接到同一行后面
             log(f"[{ci}/{len(chunks)}] 分析 {fmt_hms(lo)} ~ {fmt_hms(hi)}"
-                f"（字幕 {len(chunk_entries)} 条）")
+                f"（字幕 {len(chunk_entries)} 条）", end="")
 
-            found = analyze_chunk(entries, lo, hi, danmaku_text,
-                                  args.min_clip, LLM_MAX_CANDIDATES_PER_CHUNK,
-                                  args.prompt, args.context_sec)
+            found, stat = analyze_chunk(entries, lo, hi, danmaku_text,
+                                        args.min_clip, LLM_MAX_CANDIDATES_PER_CHUNK,
+                                        args.prompt, args.context_sec)
             for item in found:
                 cid += 1
                 item["id"] = cid
                 candidates.append(item)
-            log(f"    -> 候选 {len(found)} 个")
+            if stat.get("error"):
+                log(f" -> 失败：{stat['error'][:80]}")
+            elif stat.get("raw", 0) > len(found):
+                log(f" -> 候选 {len(found)} 个（过滤前 {stat['raw']}）")
+            else:
+                log(f" -> 候选 {len(found)} 个")
 
         if not candidates:
             raise SystemExit("没有获得任何候选片段，退出")
@@ -2455,23 +3113,58 @@ def main():
                                     args.target_max + OVERFLOW_TOLERANCE_SEC,
                                     args.min_clip)
 
+    # ---- 停顿切除：片段内部的长空白整段删掉（放在音频对齐之后，
+    #      否则外扩找静音时又会把空白补回来）----
+    if args.cut_pause > 0 and segments and entries:
+        segments, pause = cut_pauses(segments, entries, args.cut_pause)
+        if pause["removed"] > 0.1:
+            log(f"停顿切除 : {pause['from']} 段 -> {pause['pieces']} 片"
+                f"（删掉 {pause['removed']:.1f}s 空白，阈值 {args.cut_pause:g}s）")
+        else:
+            log(f"停顿切除 : 没有超过 {args.cut_pause:g}s 的空档")
+
+        # 切掉空白后成片可能短了：从候选池接着补
+        short = args.target_min - sum(s["end"] - s["start"] for s in segments)
+        if short > 1.0 and not plan_segments and pool:
+            before_pieces = len(segments)
+            before_groups = len(group_segments(segments))
+            segments, extra = top_up_segments(
+                segments, pool, entries, args.target_min,
+                args.target_max + OVERFLOW_TOLERANCE_SEC, args.min_clip,
+                args.cut_pause)
+            if extra > 0.1:
+                log(f"补足时长 : 停顿切除后偏短，又从候选池补了 "
+                    f"{len(group_segments(segments)) - before_groups} 段"
+                    f"（{len(segments) - before_pieces} 片，+{extra:.1f}s）")
+            else:
+                log(f"补足时长 : 候选池没有合适的片段可补（还差 {short:.0f}s）")
+
     total = sum(s["end"] - s["start"] for s in segments)
     if not plan_segments and total > args.target_max + 0.5:
         log(f"  ! 对齐后总时长 {total:.1f}s 超出上限 {args.target_max:g}s，"
             f"在 {OVERFLOW_TOLERANCE_SEC:g}s 容差内优先保证片段完整")
-    log(f"最终片段 : {len(segments)} 段，合计 {fmt_hms(total)}（{total:.1f}s）")
+    groups = group_segments(segments)
+    pieces_note = (f"（{len(segments)} 片）"
+                   if len(groups) != len(segments) else "")
+    log(f"最终片段 : {len(groups)} 段{pieces_note}，合计 {fmt_hms(total)}（{total:.1f}s）")
     if PROFILE["has_streamer"]:
         final = segment_profile(entries, segments)
         log(f"成片倾向 : 主播说话 {final['streamer'] * 100:.0f}%"
             f"（目标 {PROFILE['streamer_target'] * 100:.0f}%），"
             f"内容 {_fmt_mix(final['mix'])}")
-    for i, seg in enumerate(segments, 1):
-        log(f"  {i:02d} {fmt_hms(seg['start'])} ~ {fmt_hms(seg['end'])} "
-            f"({seg['end'] - seg['start']:.1f}s) "
-            f"score={seg.get('score', 0):.0f} "
-            f"[{seg.get('type') or '其他'} "
-            f"主播{(seg.get('streamer_ratio') or 0) * 100:.0f}%] "
-            f"{seg.get('title', '')}")
+    # 停顿切除会把一段拆成好几片：这里按「原片段」合并成一行，避免同一段刷好多次
+    for i, parts_of_seg in enumerate(groups, 1):
+        head = parts_of_seg[0]
+        s = min(float(p["start"]) for p in parts_of_seg)
+        e = max(float(p["end"]) for p in parts_of_seg)
+        dur = sum(_dur(p) for p in parts_of_seg)
+        note = f"，{len(parts_of_seg)} 片" if len(parts_of_seg) > 1 else ""
+        log(f"  {i:02d} {fmt_hms(s)} ~ {fmt_hms(e)} "
+            f"({dur:.1f}s{note}) "
+            f"score={head.get('score', 0):.0f} "
+            f"[{head.get('type') or '其他'} "
+            f"主播{(head.get('streamer_ratio') or 0) * 100:.0f}%] "
+            f"{head.get('title', '')}")
 
     if plan_segments:
         log(f"沿用剪辑计划: {plan_path}（不重写）")
@@ -2489,19 +3182,30 @@ def main():
 
     t0 = time.time()
     timeline = render(parts, segments, out_path, args.keep_temp,
-                      reencode=args.reencode, crf=args.reencode_crf)
+                      reencode=args.reencode, crf=args.reencode_crf,
+                      single_pass=args.single_pass)
     log(f"完成: {out_path}（耗时 {time.time() - t0:.1f}s）")
 
     # ---- 成片字幕：时间轴按实际剪辑结果重算，文本用（已在 ASR 阶段纠错过的）版本 ----
     if args.write_srt:
+        # 导出后再校一次时间轴：成片每片都要按帧 / 按采样取整，几十上百片累加
+        # 会漂零点几秒到几秒；量出每片的真实位置补回去，只动时间、不动文字
+        if args.out_align and args.out_align_shift > 0:
+            timeline, _align = align_output_timeline(
+                timeline, entries, out_path, parts, args.out_align_shift)
         srt_out = args.srt_out or (os.path.splitext(out_path)[0] + ".srt")
         subtitles = build_output_subtitles(entries, timeline)
         if subtitles:
             srt_out = os.path.abspath(srt_out)
             count = write_srt_file(subtitles, srt_out)
             shift = max((p.get("shift", 0.0) for p in timeline), default=0.0)
-            log(f"成片字幕: {srt_out}（{count} 条，已对齐到成片时间轴"
-                f"{'，关键帧最多提前 ' + format(shift, '.1f') + 's 已补偿' if shift > 0.1 else ''}）")
+            align = max((abs(p.get("align", 0.0)) for p in timeline), default=0.0)
+            note = ""
+            if align > 0.05:
+                note = f"，导出后校正最大 {align:.1f}s"
+            if shift > 0.1:
+                note += f"，关键帧最多提前 {shift:.1f}s 已补偿"
+            log(f"成片字幕: {srt_out}（{count} 条，已对齐到成片时间轴{note}）")
         else:
             log("成片字幕: 没有可用的字幕，跳过")
 
